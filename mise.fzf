@@ -40,4 +40,4 @@ version=$(
 )
 [[ $version ]] || exit 1
 
-mise use "$tool@$version"
+mise use "$@" "$tool@$version"
