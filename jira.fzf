@@ -69,6 +69,7 @@ class JiraFzf
     end
 
     @url, *args = ARGV
+    @url = @url.chomp('/')
     @jql = if args.all? { it.match?(/\A[A-Z]+\z/) }
              "project in (#{args.join(', ')}) order by updated desc"
            else
@@ -184,7 +185,7 @@ class JiraFzf
   end
 
   def get_path(path, params = nil)
-    uri = URI(@url.chomp('/') + path)
+    uri = URI(@url + path)
     uri.query = URI.encode_www_form(params) if params
     JSON.parse(Net::HTTP.get(uri, @headers), symbolize_names: true)
   end
