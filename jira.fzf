@@ -28,7 +28,6 @@ require 'optparse'
 require 'time'
 require 'json'
 require 'net/http'
-require 'open3'
 require 'shellwords'
 
 gemfile do
@@ -94,8 +93,8 @@ class JiraFzf
       puts SEPARATOR
       print_comments(issue)
     else
-      Open3.popen2(fzf) do |stdin, _stdout|
-        $stdout = stdin
+      IO.popen(fzf, 'r+') do |io|
+        $stdout = io
         search
       end
     end
