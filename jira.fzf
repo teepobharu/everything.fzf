@@ -34,6 +34,7 @@ gemfile do
   source 'https://rubygems.org'
   gem 'ansi256'
   gem 'base64'
+  gem 'openssl', '>= 3.3.1'
 end
 
 # Jira meets fzf
