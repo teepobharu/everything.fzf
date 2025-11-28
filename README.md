@@ -112,9 +112,20 @@ usage: kube.fzf [p|d|j|cj|sc|sn]
 
 ### [_pr_](https://docs.github.com/en/pull-requests)[.fzf](pr.fzf)
 
-* Check out a GitHub pull request
+* Browse and check out a GitHub pull request for the current repository
 * Press `CTRL-V` to view the pull request in Vim
 * Press `CTRL-O` to open the pull request in your browser
+
+### [_pr-by_](https://docs.github.com/en/pull-requests)[.fzf](pr-by.fzf)
+
+* Search GitHub pull requests by a specific user across all repositories
+* Press `CTRL-V` to view the pull request in Vim
+* Press `CTRL-O` to open the pull request in your browser
+
+```sh
+# usage: pr-by.fzf [--limit=N] <author> [fzf-args]
+pr-by.fzf junegunn
+```
 
 ### [_rg_](https://github.com/BurntSushi/ripgrep)[.fzf](rg.fzf)
 

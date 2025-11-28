@@ -22,14 +22,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# usage: pr-by.fzf [--limit=N] <author> [fzf-args]
+limit=50
+if [[ "$1" == --limit=* ]]; then
+  limit="${1#--limit=}"
+  shift
+fi
+who=$1
+shift
+
 fzf --tmux 80%,100%,border-native --ansi \
     --info inline --reverse --header-lines 4 \
-    --preview 'GH_FORCE_TTY=$FZF_PREVIEW_COLUMNS gh pr view --comments {1}' \
+    --preview 'GH_FORCE_TTY=$FZF_PREVIEW_COLUMNS gh pr view --repo {1} --comments {2}' \
     --preview-window up:border-down \
     --with-shell 'bash -c' \
-    --bind 'start:preview(echo Loading pull requests ...)+reload:GH_FORCE_TTY=95% gh pr list --limit=1000' \
+    --bind "start:preview(echo Loading pull requests ...)+reload:GH_FORCE_TTY=95% gh search prs --author $who --limit $limit" \
     --bind 'load:transform:(( FZF_TOTAL_COUNT )) || echo become:echo No pull requests' \
-    --bind 'ctrl-o:execute-silent:gh pr view --web {1}' \
-    --bind 'ctrl-v:execute:gh pr view {1} | sed "s/\r//g" | view - +"setf markdown"' \
-    --bind 'enter:become:gh pr checkout {1}' \
-    --footer 'Press Enter to checkout / CTRL-O to open in browser / CTRL-V to open in editor' "$@"
+    --bind 'enter,ctrl-o:execute-silent:gh pr view --web --repo {1} {2}' \
+    --bind 'ctrl-v:execute:gh pr view --repo {1} {2} | sed "s/\r//g" | view - +"setf markdown"' \
+    --footer 'CTRL-O to open in browser / CTRL-V to open in editor' "$@"
