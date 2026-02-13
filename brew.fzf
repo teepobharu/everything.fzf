@@ -78,12 +78,14 @@ do_upgrade() {
   printf "\nUpgrade all? (y/n): "
   read -r confirm
   if [ "$confirm" = y ] || [ "$confirm" = Y ]; then
-    echo "$selected" | while read -r pkg; do
+    # Process each package line by line, handling special chars properly
+    while IFS= read -r pkg || [ -n "$pkg" ]; do
+      [ -z "$pkg" ] && continue
       sanitized=$(sanitize_package_name "$pkg")
       echo "Upgrading $pkg..."
       brew upgrade "$pkg" 2>&1 | tee ~/dotfiles/logs/brew-${sanitized}.log
       echo "✓ $pkg upgraded"
-    done
+    done <<< "$selected"
     echo ""
     echo "✓ All upgrades completed!"
   else
@@ -102,12 +104,14 @@ do_uninstall() {
   printf "\nUninstall all? (y/n): "
   read -r confirm
   if [ "$confirm" = y ] || [ "$confirm" = Y ]; then
-    echo "$selected" | while read -r pkg; do
+    # Process each package line by line, handling special chars properly
+    while IFS= read -r pkg || [ -n "$pkg" ]; do
+      [ -z "$pkg" ] && continue
       sanitized=$(sanitize_package_name "$pkg")
       echo "Uninstalling $pkg..."
       brew uninstall "$pkg" 2>&1 | tee ~/dotfiles/logs/brew-uninstall-${sanitized}.log
       echo "✓ $pkg uninstalled"
-    done
+    done <<< "$selected"
     echo ""
     echo "✓ All uninstalls completed!"
   else
