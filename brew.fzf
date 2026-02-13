@@ -1,0 +1,69 @@
+#!/bin/bash
+
+# brew.fzf - Interactive Homebrew package manager with FZF
+# Allows multi-select, preview, and interactive package management
+# Features:
+#   - Multi-select packages to upgrade
+#   - Enhanced preview with version highlights (installed + HEAD)
+#   - Keybindings for various operations
+#   - Logging of upgrade operations
+
+set -o pipefail
+
+# Create logs directory if it doesn't exist
+mkdir -p ~/dotfiles/logs
+
+# Function to format brew info with highlights for installed and HEAD versions
+format_brew_preview() {
+  local pkg="$1"
+  local info=$(brew info "$pkg" 2>/dev/null)
+  
+  # Color codes
+  local bold='\033[1m'
+  local reverse='\033[7m'
+  local reset='\033[0m'
+  
+  # Process line by line
+  local in_installed=0
+  local line_count=0
+  
+  echo "$info" | while IFS= read -r line; do
+    ((line_count++))
+    
+    # Highlight first line (versions: stable, HEAD)
+    if [ $line_count -eq 1 ]; then
+      echo -e "${bold}${line}${reset}"
+      echo ""
+      continue
+    fi
+    
+    # Highlight "Installed" section header
+    if [[ "$line" =~ ^Installed$ ]]; then
+      echo -e "${bold}${line}${reset}"
+      in_installed=1
+      continue
+    fi
+    
+    # Highlight installed path/version (cellar path)
+    if [[ "$line" =~ ^/opt/homebrew/Cellar ]] || [[ "$line" =~ ^/usr/local/Cellar ]]; then
+      echo -e "${reverse}${line}${reset}"
+      in_installed=0
+      continue
+    fi
+    
+    # Normal output
+    echo "$line"
+  done
+}
+
+export -f format_brew_preview
+
+brew outdated | \
+  fzf \
+    --multi \
+    --prompt="Select packages to upgrade: " \
+    --preview-window="right:55%,wrap" \
+    --preview="format_brew_preview {}" \
+    --header="CTRL-U: upgrade | CTRL-I: home | CTRL-A: reload all | Enter: confirm & upgrade" \
+    --bind="ctrl-u:execute-silent(echo {} | xargs -n1 -I{} sh -c 'echo \"Upgrading {}...\" && brew upgrade {} 2>&1 | tee ~/dotfiles/logs/brew-{}.log && echo \"✓ {} upgraded\"'),ctrl-i:execute-silent(brew home {}),ctrl-a:reload(brew list),enter:execute(sh -c 'selected=\"{}\"; if [ -n \"\$selected\" ]; then echo \"Selected packages:\"; echo \"\$selected\" | sed \"s/^/  - /\"; printf \"Upgrade all? (y/n): \"; read -r confirm; if [ \"\$confirm\" = y ] || [ \"\$confirm\" = Y ]; then echo \"\$selected\" | xargs -n1 -I{} sh -c \"echo \\\"Upgrading {}...\\\" && brew upgrade {} 2>&1 | tee ~/dotfiles/logs/brew-{}.log && echo \\\"✓ {} upgraded\\\"\"; echo \"All upgrades completed!\"; else echo \"Cancelled.\"; fi; fi')" \
+    "$@"
