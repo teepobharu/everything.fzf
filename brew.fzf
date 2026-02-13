@@ -3,10 +3,11 @@
 # brew.fzf - Interactive Homebrew package manager with FZF
 # Allows multi-select, preview, and interactive package management
 # Features:
-#   - Multi-select packages to upgrade
+#   - Toggle between outdated and all installed packages
+#   - Upgrade/uninstall packages with confirmation
 #   - Enhanced preview with version highlights (installed + HEAD)
 #   - Keybindings for various operations
-#   - Logging of upgrade operations
+#   - Logging of operations
 
 set -o pipefail
 
@@ -68,12 +69,144 @@ format_brew_preview() {
 
 export -f format_brew_preview
 
-brew outdated | \
-  fzf \
-    --multi \
-    --prompt="Select packages to upgrade: " \
-    --preview-window="right:55%,wrap" \
-    --preview="format_brew_preview {}" \
-    --header="CTRL-X: upgrade | CTRL-I: home | CTRL-A: reload all | Enter: confirm & upgrade" \
-    --bind="ctrl-x:execute-silent(echo {} | xargs -n1 -I{} sh -c 'sanitized=\$(sanitize_package_name \"{}\"); echo \"Upgrading {}...\" && brew upgrade {} 2>&1 | tee ~/dotfiles/logs/brew-\${sanitized}.log && echo \"✓ {} upgraded\"'),ctrl-i:execute-silent(brew home {}),ctrl-a:reload(brew list),enter:execute(sh -c 'selected=\"{+}\"; if [ -n \"\$selected\" ]; then echo \"Selected packages:\"; echo \"\$selected\" | sed \"s/^/  - /\"; printf \"\\nUpgrade all? (y/n): \"; read -r confirm; if [ \"\$confirm\" = y ] || [ \"\$confirm\" = Y ]; then echo \"\$selected\" | xargs -n1 -I{} sh -c \"sanitized=\\\"\\$(sanitize_package_name \\\"{}\\\")\\\"; echo \\\"Upgrading {}...\\\" && brew upgrade {} 2>&1 | tee ~/dotfiles/logs/brew-\\\${sanitized}.log && echo \\\"✓ {} upgraded\\\"\"; echo \"\\nAll upgrades completed!\"; else echo \"Cancelled.\"; fi; fi')" \
-    "$@"
+# Function to perform upgrade action
+do_upgrade() {
+  local selected="$1"
+  echo ""
+  echo "Selected packages to upgrade:"
+  echo "$selected" | sed 's/^/  - /'
+  printf "\nUpgrade all? (y/n): "
+  read -r confirm
+  if [ "$confirm" = y ] || [ "$confirm" = Y ]; then
+    echo "$selected" | while read -r pkg; do
+      sanitized=$(sanitize_package_name "$pkg")
+      echo "Upgrading $pkg..."
+      brew upgrade "$pkg" 2>&1 | tee ~/dotfiles/logs/brew-${sanitized}.log
+      echo "✓ $pkg upgraded"
+    done
+    echo ""
+    echo "✓ All upgrades completed!"
+  else
+    echo "Cancelled."
+  fi
+}
+
+export -f do_upgrade
+
+# Function to perform uninstall action
+do_uninstall() {
+  local selected="$1"
+  echo ""
+  echo "Selected packages to uninstall:"
+  echo "$selected" | sed 's/^/  - /'
+  printf "\nUninstall all? (y/n): "
+  read -r confirm
+  if [ "$confirm" = y ] || [ "$confirm" = Y ]; then
+    echo "$selected" | while read -r pkg; do
+      sanitized=$(sanitize_package_name "$pkg")
+      echo "Uninstalling $pkg..."
+      brew uninstall "$pkg" 2>&1 | tee ~/dotfiles/logs/brew-uninstall-${sanitized}.log
+      echo "✓ $pkg uninstalled"
+    done
+    echo ""
+    echo "✓ All uninstalls completed!"
+  else
+    echo "Cancelled."
+  fi
+}
+
+export -f do_uninstall
+
+# Default to showing outdated packages
+show_outdated=true
+
+while true; do
+  # Determine which list to show
+  if [ "$show_outdated" = true ]; then
+    package_list=$(brew outdated)
+    mode_label="OUTDATED"
+    prompt_text="Select packages to upgrade"
+  else
+    package_list=$(brew list)
+    mode_label="ALL INSTALLED"
+    prompt_text="Select packages to manage"
+  fi
+
+  # Run FZF with expect to capture key presses
+  result=$(echo "$package_list" | \
+    fzf \
+      --multi \
+      --prompt="[$mode_label] $prompt_text: " \
+      --preview-window="right:55%,wrap" \
+      --preview="format_brew_preview {}" \
+      --expect=ctrl-t,ctrl-x,ctrl-d,ctrl-i \
+      --header="CTRL-T: toggle | CTRL-X: upgrade | CTRL-D: uninstall | CTRL-I: home | Enter: action" \
+      "$@")
+
+  # Separate key from selection
+  key=$(echo "$result" | head -1)
+  selected=$(echo "$result" | tail -n +2)
+
+  case "$key" in
+    ctrl-t)
+      # Toggle between outdated and all packages
+      show_outdated=$([ "$show_outdated" = true ] && echo false || echo true)
+      continue
+      ;;
+    ctrl-x)
+      # Upgrade selected packages
+      if [ -n "$selected" ]; then
+        do_upgrade "$selected"
+      fi
+      exit 0
+      ;;
+    ctrl-d)
+      # Uninstall selected packages
+      if [ -n "$selected" ]; then
+        do_uninstall "$selected"
+      fi
+      exit 0
+      ;;
+    ctrl-i)
+      # Open home for first selected package (open in background)
+      if [ -n "$selected" ]; then
+        first_pkg=$(echo "$selected" | head -1)
+        brew home "$first_pkg" &
+      fi
+      continue
+      ;;
+    "")
+      # Enter key pressed - default action based on mode
+      if [ -n "$selected" ]; then
+        if [ "$show_outdated" = true ]; then
+          # In outdated mode, default to upgrade
+          do_upgrade "$selected"
+        else
+          # In all packages mode, ask user what to do
+          echo ""
+          echo "Selected packages:"
+          echo "$selected" | sed 's/^/  - /'
+          echo ""
+          printf "Action - (u)pgrade, (d)elete, (c)ancel: "
+          read -r action_choice
+          case "$action_choice" in
+            u|U)
+              do_upgrade "$selected"
+              ;;
+            d|D)
+              do_uninstall "$selected"
+              ;;
+            *)
+              echo "Cancelled."
+              ;;
+          esac
+        fi
+      fi
+      exit 0
+      ;;
+    *)
+      # User pressed ESC or other exit
+      exit 0
+      ;;
+  esac
+done
