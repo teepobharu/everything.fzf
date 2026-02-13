@@ -13,6 +13,16 @@ set -o pipefail
 # Create logs directory if it doesn't exist
 mkdir -p ~/dotfiles/logs
 
+# Function to sanitize package names for safe log filenames
+# Converts slashes and special chars to underscores
+# e.g., "devops/tap/devstack" -> "devops_tap_devstack"
+sanitize_package_name() {
+  local pkg="$1"
+  echo "$pkg" | sed 's/[\/\-\.\@]/_/g'
+}
+
+export -f sanitize_package_name
+
 # Function to format brew info with highlights for installed and HEAD versions
 format_brew_preview() {
   local pkg="$1"
@@ -65,5 +75,5 @@ brew outdated | \
     --preview-window="right:55%,wrap" \
     --preview="format_brew_preview {}" \
     --header="CTRL-U: upgrade | CTRL-I: home | CTRL-A: reload all | Enter: confirm & upgrade" \
-    --bind="ctrl-u:execute-silent(echo {} | xargs -n1 -I{} sh -c 'echo \"Upgrading {}...\" && brew upgrade {} 2>&1 | tee ~/dotfiles/logs/brew-{}.log && echo \"✓ {} upgraded\"'),ctrl-i:execute-silent(brew home {}),ctrl-a:reload(brew list),enter:execute(sh -c 'selected=\"{}\"; if [ -n \"\$selected\" ]; then echo \"Selected packages:\"; echo \"\$selected\" | sed \"s/^/  - /\"; printf \"Upgrade all? (y/n): \"; read -r confirm; if [ \"\$confirm\" = y ] || [ \"\$confirm\" = Y ]; then echo \"\$selected\" | xargs -n1 -I{} sh -c \"echo \\\"Upgrading {}...\\\" && brew upgrade {} 2>&1 | tee ~/dotfiles/logs/brew-{}.log && echo \\\"✓ {} upgraded\\\"\"; echo \"All upgrades completed!\"; else echo \"Cancelled.\"; fi; fi')" \
+    --bind="ctrl-u:execute-silent(echo {} | xargs -n1 -I{} sh -c 'sanitized=\$(sanitize_package_name \"{}\"); echo \"Upgrading {}...\" && brew upgrade {} 2>&1 | tee ~/dotfiles/logs/brew-\${sanitized}.log && echo \"✓ {} upgraded\"'),ctrl-i:execute-silent(brew home {}),ctrl-a:reload(brew list),enter:execute(sh -c 'selected=\"{+}\"; if [ -n \"\$selected\" ]; then echo \"Selected packages:\"; echo \"\$selected\" | sed \"s/^/  - /\"; printf \"\\nUpgrade all? (y/n): \"; read -r confirm; if [ \"\$confirm\" = y ] || [ \"\$confirm\" = Y ]; then echo \"\$selected\" | xargs -n1 -I{} sh -c \"sanitized=\\\"\\$(sanitize_package_name \\\"{}\\\")\\\"; echo \\\"Upgrading {}...\\\" && brew upgrade {} 2>&1 | tee ~/dotfiles/logs/brew-\\\${sanitized}.log && echo \\\"✓ {} upgraded\\\"\"; echo \"\\nAll upgrades completed!\"; else echo \"Cancelled.\"; fi; fi')" \
     "$@"
