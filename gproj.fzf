@@ -16,8 +16,14 @@ set -euo pipefail
 #  1. [HIGH] alt-w: List worktrees for highlighted repo with actions (lazygit/nvim/code)
 #       - Nested fzf showing: git worktree list --porcelain
 #       - Bindings: enter=cd, ctrl-l=lazygit, ctrl-v=nvim, ctrl-e=code
-#  2. [MEDIUM] Arrow keys: Dynamic depth adjustment (similar to FZF_CTRL_T_OPTS)
-#  3. [LOW] Type labels: Show [🔗worktree]/[📦submodule]/[📁main] indicators in fzf list
+#  2. [DONE] alt-v: Nvim profile picker — open repo/worktree with chosen NVIM_APPNAME
+#       - Scans $XDG_CONFIG_HOME for nvim* dirs with init.lua/init.vim/lua/
+#       - Launches: XDG_CONFIG_HOME=<config_home> NVIM_APPNAME=<profile> nvim .
+#       - Per-process env only — no global mutation, no effect on other panes
+#       - Lesson: fzf execute() + bash -c + printf '%q' heredoc = nested quoting hell
+#         Fix: write script to temp file, invoke via bash $tmpfile
+#  3. [MEDIUM] Arrow keys: Dynamic depth adjustment (similar to FZF_CTRL_T_OPTS)
+#  4. [LOW] Type labels: Show [🔗worktree]/[📦submodule]/[📁main] indicators in fzf list
 #       - Worktree: .git is a file (contains gitdir: reference)
 #       - Submodule: .git dir inside .git/modules/ of parent
 #       - Main: .git is a directory in repo root
@@ -27,7 +33,7 @@ set -euo pipefail
 #  - Benchmark on ~/AgodaGit: fd -H -g '\.git' ~4.0s, with --follow ~4.5s
 
 DEFAULT_ROOTS=("$HOME/AgodaGit" "$HOME/Personal" "$HOME/.local/share/opencode/worktree" "$HOME/worktrees" "${DOTFILES_DIR:-$HOME/dotfiles}")
-DEFAULT_IGNORES=("$HOME/.ssh" "$HOME/Downloads" "$HOME/OrbStack" "node_modules" "$HOME/OneDrive*" "$HOME/Applications")
+DEFAULT_IGNORES=("$HOME/.ssh" "$HOME/Downloads" "$HOME/OrbStack" "node_modules" "$HOME/OneDrive*" "$HOME/Applications" "$HOME/.local/share/nvim*" "$HOME/.local/state/nvim*" "$HOME/.cache/nvim*")
 
 ROOTS_ENV=${EVERYTHING_FZF_ROOTS:-}
 IGNORES_ENV=${EVERYTHING_FZF_IGNORES:-}
@@ -36,7 +42,9 @@ MAX_DEPTH=${GPROJ_MAX_DEPTH:-8}
 CACHE_ENABLED=${GPROJ_CACHE:-1}
 CACHE_TTL=${GPROJ_CACHE_TTL:-1800}
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gproj"
-INCLUDE_SUBMODULES=${GPROJ_INCLUDE_SUBMODULES:-0}  # Reserved for future repo type labeling
+INCLUDE_SUBMODULES=${GPROJ_INCLUDE_SUBMODULES:-0} # Reserved for future repo type labeling
+NVIM_CONFIG_HOME_DEFAULT="${DOTFILES_DIR:-$HOME/dotfiles}/.config"
+NVIM_CONFIG_HOME=${GPROJ_NVIM_CONFIG_HOME:-${XDG_CONFIG_HOME:-$NVIM_CONFIG_HOME_DEFAULT}}
 
 # Warn if reserved flags are used
 if [ "$INCLUDE_SUBMODULES" -eq 1 ]; then
@@ -68,11 +76,13 @@ Options:
   --cmd 'command'   Execute command with '{}' replaced
 
 Environment:
-  GPROJ_DEBUG=1       Enable timing logs
-  GPROJ_MAX_DEPTH=N   Max depth (default: 8)
-  GPROJ_CACHE=0       Disable cache
-  GPROJ_CACHE_TTL=N   Cache seconds (default: 1800)
+  GPROJ_DEBUG=1             Enable timing logs
+  GPROJ_MAX_DEPTH=N         Max depth (default: 8)
+  GPROJ_CACHE=0             Disable cache
+  GPROJ_CACHE_TTL=N         Cache seconds (default: 1800)
   GPROJ_INCLUDE_SUBMODULES=1  [Reserved] Future type labeling
+  GPROJ_NVIM_CONFIG_HOME    Override Neovim profile config home
+
 
 Examples:
   gproj
@@ -123,7 +133,7 @@ for i in "${!IGNORES[@]}"; do IGNORES[$i]="${IGNORES[$i]/#\~/$HOME}"; done
 log_timing "config"
 
 TMPF=$(mktemp)
-trap 'rm -f "$TMPF"' EXIT
+trap 'rm -f "$TMPF" "${NVIM_PROFILE_TMPF:-}"' EXIT
 
 # Cache setup
 mkdir -p "$CACHE_DIR" 2>/dev/null || true
@@ -183,7 +193,7 @@ else
       #
       # Performance comparison (tested on ~/AgodaGit):
       #   fd -g '[. ]git' --ignore-file <(echo '!.git/') : ~4.0s
-      #   fd -H -g '\.git' -t d                          : ~4.0s  
+      #   fd -H -g '\.git' -t d                          : ~4.0s
       #   fd -H --follow -g '\.git' -t d                 : ~4.5s (previous)
       #   fd -H --follow -g '\.git' (no -t)              : ~4.5s (current - finds worktrees too!)
       #
@@ -267,10 +277,11 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 PREVIEW_EOF
 
-HEADER="ENTER=cd | CTRL-V=nvim | CTRL-E=code | CTRL-R=refresh | TAB=select | ESC=cancel | 📂 $COMMON_DIR"
+HEADER="ENTER=cd | CTRL-V=nvim | ALT-V=nvim(profile) | CTRL-E=code | CTRL-R=refresh | TAB=select | ESC=cancel | 📂 $COMMON_DIR"
 
 # Reload script for ctrl-r (invalidate cache and rescan)
 read -r -d '' RELOAD_SCRIPT <<'RELOAD_EOF' || true
+
 #!/usr/bin/env bash
 CACHE_FILE="$1"
 shift
@@ -316,6 +327,105 @@ sed 's|/\.git/*$||' "$TMP" | sort -u
 rm -f "$TMP"
 RELOAD_EOF
 
+# Profile picker for opening selected repo/worktree in a specific Neovim profile
+# Written to a temp file to avoid nested quoting issues with fzf execute()
+NVIM_PROFILE_TMPF=$(mktemp "${TMPDIR:-/tmp}/gproj-nvim-profile.XXXXXX")
+cat >"$NVIM_PROFILE_TMPF" <<'NVIM_PROFILE_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+TARGET_PATH="$1"
+CURRENT_PANE="${2:-}"
+NVIM_CONFIG_HOME="$3"
+LOG_DIR="$4"
+LOG_FILE="$LOG_DIR/gproj_altv.log"
+
+[ -n "$TARGET_PATH" ] || exit 1
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+printf '%s | alt-v triggered | target=%s | pane=%s | config_home=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$TARGET_PATH" "$CURRENT_PANE" "$NVIM_CONFIG_HOME" >> "$LOG_FILE" 2>/dev/null || true
+[ -d "$NVIM_CONFIG_HOME" ] || {
+  echo "No Neovim config home: $NVIM_CONFIG_HOME" >&2
+  printf '%s | alt-v error | missing config home=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$NVIM_CONFIG_HOME" >> "$LOG_FILE" 2>/dev/null || true
+  exit 1
+}
+
+sanitize_name() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g; s/-\{2,\}/-/g; s/^-//; s/-$//'
+}
+
+is_valid_profile() {
+  local profile_path="$1"
+  [ -d "$profile_path" ] || [ -L "$profile_path" ] || return 1
+  [ -f "$profile_path/init.lua" ] || [ -f "$profile_path/init.vim" ] || [ -d "$profile_path/lua" ]
+}
+
+TARGET_BASENAME=$(basename "$TARGET_PATH")
+TARGET_SANITIZED=$(sanitize_name "$TARGET_BASENAME")
+SUGGESTED_PROFILE="nvim-$TARGET_SANITIZED"
+PROFILES_FILE=$(mktemp)
+trap 'rm -f "$PROFILES_FILE"' EXIT
+
+if is_valid_profile "$NVIM_CONFIG_HOME/nvim"; then
+  printf '__DEFAULT__\t%s\n' "nvim" > "$PROFILES_FILE"
+fi
+
+for entry in "$NVIM_CONFIG_HOME"/nvim*; do
+  [ -e "$entry" ] || continue
+  [ -d "$entry" ] || [ -L "$entry" ] || continue
+  is_valid_profile "$entry" || continue
+  profile_name=$(basename "$entry")
+  marker=""
+  [ "$profile_name" = "nvim" ] && marker=" [default]"
+  [ "$profile_name" = "$SUGGESTED_PROFILE" ] && marker=" [match]"
+  printf '%s\t%s%s\n' "$profile_name" "$entry" "$marker"
+done | sort -u >> "$PROFILES_FILE"
+
+[ -s "$PROFILES_FILE" ] || {
+  echo "No Neovim profiles found in $NVIM_CONFIG_HOME" >&2
+  printf '%s | alt-v error | no profiles found in %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$NVIM_CONFIG_HOME" >> "$LOG_FILE" 2>/dev/null || true
+  exit 1
+}
+
+SELECTED_LINE=$(awk -F '\t' -v suggested="$SUGGESTED_PROFILE" '
+  BEGIN { matched = 0 }
+  {
+    if ($1 == "__DEFAULT__") {
+      printf "nvim\t%s [default]\n", $2
+    } else {
+      print $0
+    }
+    if ($1 == suggested) matched = NR
+  }
+' "$PROFILES_FILE" | fzf \
+  --ansi \
+  --prompt='nvim-profile> ' \
+  --with-nth=1 \
+  --delimiter='\t' \
+  --header="ENTER=open with chosen profile | ESC=cancel | config home: $NVIM_CONFIG_HOME" \
+  --preview='echo "profile: $(echo {} | cut -f1)" && echo "config: $(echo {} | cut -f2)" && echo "" && P=$(echo {} | cut -f2); [ -f "$P/init.lua" ] && echo "init.lua"; [ -f "$P/init.vim" ] && echo "init.vim"; [ -d "$P/lua" ] && echo "lua/"' \
+  --preview-window='right:50%:wrap' \
+  --bind="start:pos(1)" )
+
+[ -n "$SELECTED_LINE" ] || {
+  printf '%s | alt-v cancelled | target=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$TARGET_PATH" >> "$LOG_FILE" 2>/dev/null || true
+  exit 130
+}
+SELECTED_PROFILE=$(printf '%s' "$SELECTED_LINE" | cut -f1)
+
+TARGET_QUOTED=$(printf '%q' "$TARGET_PATH")
+CONFIG_HOME_QUOTED=$(printf '%q' "$NVIM_CONFIG_HOME")
+PROFILE_QUOTED=$(printf '%q' "$SELECTED_PROFILE")
+LAUNCH_CMD="cd $TARGET_QUOTED && XDG_CONFIG_HOME=$CONFIG_HOME_QUOTED NVIM_APPNAME=$PROFILE_QUOTED nvim ."
+printf '%s | alt-v selected | target=%s | profile=%s | launch=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$TARGET_PATH" "$SELECTED_PROFILE" "$LAUNCH_CMD" >> "$LOG_FILE" 2>/dev/null || true
+
+if [ -n "$CURRENT_PANE" ]; then
+  tmux send-keys -t "$CURRENT_PANE" "$LAUNCH_CMD" Enter
+else
+  eval "$LAUNCH_CMD"
+fi
+NVIM_PROFILE_EOF
+chmod +x "$NVIM_PROFILE_TMPF"
+
 # ============================================================================
 # DRAFT: alt-w binding for worktree listing (COMMENTED OUT - NOT IMPLEMENTED)
 # ============================================================================
@@ -327,15 +437,15 @@ RELOAD_EOF
 # #!/usr/bin/env bash
 # REPO="$1"
 # CURRENT_PANE="${2:-%0}"
-# 
+#
 # # Check if repo has worktrees
 # cd "$REPO" 2>/dev/null || exit 1
-# 
+#
 # # Get worktree list
 # WORKTREES=$(git worktree list --porcelain 2>/dev/null | awk '
 #   /^worktree / { path = substr($0, 10); }
 #   /^branch / { branch = substr($0, 8); }
-#   /^$/ { 
+#   /^$/ {
 #     if (path != "" && branch != "") {
 #       # Format: /path/to/worktree [🔗branch-name]
 #       printf "%s [🔗%s]\n", path, branch;
@@ -344,9 +454,9 @@ RELOAD_EOF
 #     }
 #   }
 # ')
-# 
+#
 # [ -z "$WORKTREES" ] && echo "No worktrees found for this repo" && exit 0
-# 
+#
 # # Launch nested fzf for worktree selection
 # echo "$WORKTREES" | fzf \
 #   --ansi \
@@ -367,7 +477,7 @@ RELOAD_EOF
 
 # Prepare reload parameters (join arrays with |)
 ROOTS_JOINED=$(printf '%s|' "${ROOTS[@]}")
-ROOTS_JOINED="${ROOTS_JOINED%|}"  # Remove trailing |
+ROOTS_JOINED="${ROOTS_JOINED%|}" # Remove trailing |
 IGNORES_JOINED=$(printf '%s|' "${IGNORES[@]}")
 IGNORES_JOINED="${IGNORES_JOINED%|}"
 
@@ -389,21 +499,32 @@ if [ "$IN_TMUX" -eq 1 ]; then
     --preview-window='right:60%:wrap' \
     --bind="enter:execute-silent(tmux send-keys -t $CURRENT_PANE 'cd \"{}\"' Enter)+abort" \
     --bind="ctrl-v:execute-silent(tmux send-keys -t $CURRENT_PANE 'nvim \"{}\"' Enter)+abort" \
+    --bind="alt-v:execute(bash $NVIM_PROFILE_TMPF {} $CURRENT_PANE $(printf '%q' "$NVIM_CONFIG_HOME") $(printf '%q' "$PWD/logs"))+abort" \
     --bind="ctrl-e:execute-silent(tmux send-keys -t $CURRENT_PANE 'code \"{}\"' Enter)+abort" \
     --bind="ctrl-o:accept" \
     --bind="ctrl-r:reload(bash -c $(printf '%q' "$RELOAD_SCRIPT") gproj-reload $(printf '%q' "$CACHE_FILE") $(printf '%q' "$ROOTS_JOINED") $(printf '%q' "$IGNORES_JOINED") $MAX_DEPTH $DEBUG)" \
     <"$TMPF")
+
 else
   # Not in tmux - just return the selection for manual use
-  SELECTED=$(fzf \
-    --ansi \
-    --multi \
-    --prompt='gproj> ' \
-    --header="$HEADER (use in tmux for cd support)" \
-    --preview "bash -c $(printf '%q' "$PREVIEW_SCRIPT") -- {}" \
-    --preview-window='right:60%:wrap' \
-    --bind="ctrl-r:reload(bash -c $(printf '%q' "$RELOAD_SCRIPT") gproj-reload $(printf '%q' "$CACHE_FILE") $(printf '%q' "$ROOTS_JOINED") $(printf '%q' "$IGNORES_JOINED") $MAX_DEPTH $DEBUG)" \
-    <"$TMPF")
+  # checked  alt-v works
+  SELECTED=$(
+    fzf \
+      --ansi \
+      --multi \
+      --prompt='gproj> ' \
+      --header="$HEADER (use in tmux for cd support)" \
+      --preview "bash -c $(printf '%q' "$PREVIEW_SCRIPT") -- {}" \
+      --preview-window='right:60%:wrap' \
+      --bind="ctrl-r:reload(bash -c $(printf '%q' "$RELOAD_SCRIPT") gproj-reload $(printf '%q' "$CACHE_FILE") $(printf '%q' "$ROOTS_JOINED") $(printf '%q' "$IGNORES_JOINED") $MAX_DEPTH $DEBUG)" \
+      --bind="enter:execute-silent(open ~/dotfiles)+abort" \
+      --bind="alt-d:execute(open $HOME/dotfiles)+abort" \
+      --bind="alt-p:become(vim)+abort" \
+      --bind="ctrl-v:execute(nvim -- {1})" \
+      --bind="alt-v:execute(bash $NVIM_PROFILE_TMPF {} '' $(printf '%q' "$NVIM_CONFIG_HOME") $(printf '%q' "$PWD/logs"))+abort" \
+      --bind="ctrl-e:execute-silent('code \"{}\"' Enter)+abort" \
+      <"$TMPF"
+  )
 fi
 
 [ -z "${SELECTED:-}" ] && exit 130

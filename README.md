@@ -139,9 +139,11 @@ pr-by.fzf junegunn
   - `GPROJ_MAX_DEPTH=N` — max search depth (default: 5, lower = faster)
   - `GPROJ_CACHE=0` — disable result caching (default: enabled, 30min TTL)
   - `GPROJ_DEBUG=1` — show timing breakdown
+  - `GPROJ_NVIM_CONFIG_HOME` — override Neovim profile config home (default: `$XDG_CONFIG_HOME` or `~/dotfiles/.config`)
 - Keybindings (in tmux):
   - `ENTER` — cd to selected path
   - `CTRL-V` — cd and open in nvim
+  - `ALT-V` — choose a Neovim profile (via `NVIM_APPNAME`), then open selected path
   - `CTRL-E` — cd and open in VSCode
   - `CTRL-O` — print path without cd
 - Example:
