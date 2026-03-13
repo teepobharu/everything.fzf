@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# gproj - Git project picker with fzf (optimized)
+#
+# Environment variables:
+#  - EVERYTHING_FZF_ROOTS   (colon-separated list of roots)
+#  - EVERYTHING_FZF_IGNORES (colon-separated list of paths/names to ignore)
+#  - GPROJ_DEBUG=1          Enable debug timing logs
+#  - GPROJ_MAX_DEPTH=N      Max search depth (default: 5)
+#  - GPROJ_CACHE=0          Disable caching (default: enabled)
+#  - GPROJ_CACHE_TTL=N      Cache TTL in seconds (default: 1800)
+#  - GPROJ_INCLUDE_SUBMODULES=1  [Reserved] Future: label repo types [🔗worktree]/[📦submodule]
+#
+# Future Features (Priority Order):
+#  1. [HIGH] alt-w: List worktrees for highlighted repo with actions (lazygit/nvim/code)
+#       - Nested fzf showing: git worktree list --porcelain
+#       - Bindings: enter=cd, ctrl-l=lazygit, ctrl-v=nvim, ctrl-e=code
+#  2. [MEDIUM] Arrow keys: Dynamic depth adjustment (similar to FZF_CTRL_T_OPTS)
+#  3. [LOW] Type labels: Show [🔗worktree]/[📦submodule]/[📁main] indicators in fzf list
+#       - Worktree: .git is a file (contains gitdir: reference)
+#       - Submodule: .git dir inside .git/modules/ of parent
+#       - Main: .git is a directory in repo root
+#
+# Performance Notes:
+#  - fd --follow: Kept for symlink/worktree support (~0.5s overhead, acceptable tradeoff)
+#  - Benchmark on ~/AgodaGit: fd -H -g '\.git' ~4.0s, with --follow ~4.5s
+
+DEFAULT_ROOTS=("$HOME/AgodaGit" "$HOME/Personal" "$HOME/.local/share/opencode/worktree" "$HOME/worktrees" "${DOTFILES_DIR:-$HOME/dotfiles}")
+DEFAULT_IGNORES=("$HOME/.ssh" "$HOME/Downloads" "$HOME/OrbStack" "node_modules" "$HOME/OneDrive*" "$HOME/Applications")
+
+ROOTS_ENV=${EVERYTHING_FZF_ROOTS:-}
+IGNORES_ENV=${EVERYTHING_FZF_IGNORES:-}
+DEBUG=${GPROJ_DEBUG:-0}
+MAX_DEPTH=${GPROJ_MAX_DEPTH:-8}
+CACHE_ENABLED=${GPROJ_CACHE:-1}
+CACHE_TTL=${GPROJ_CACHE_TTL:-1800}
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gproj"
+INCLUDE_SUBMODULES=${GPROJ_INCLUDE_SUBMODULES:-0}  # Reserved for future repo type labeling
+
+# Warn if reserved flags are used
+if [ "$INCLUDE_SUBMODULES" -eq 1 ]; then
+  echo "[gproj] Warning: GPROJ_INCLUDE_SUBMODULES is not yet implemented." >&2
+  echo "[gproj]          This flag is reserved for future type labeling ([🔗worktree]/[📦submodule])." >&2
+fi
+
+if [ $DEBUG -eq 1 ]; then
+  CACHE_ENABLED=0
+fi
+
+START_TIME=$(date +%s%N 2>/dev/null || echo "0")
+log_timing() {
+  if [ "$DEBUG" -eq 1 ] && [ "$START_TIME" != "0" ]; then
+    NOW=$(date +%s%N 2>/dev/null || echo "0")
+    [ "$NOW" != "0" ] && ELAPSED=$(((NOW - START_TIME) / 1000000)) || ELAPSED="?"
+    echo "[gproj] $1: ${ELAPSED}ms" >&2
+  fi
+}
+
+show_help() {
+  cat <<'EOF'
+gproj - pick a git repository root with fzf
+
+Options:
+  -h, --help        Show this help
+  --roots PATHS     Colon-separated roots
+  --ignores PATHS   Colon-separated ignores
+  --cmd 'command'   Execute command with '{}' replaced
+
+Environment:
+  GPROJ_DEBUG=1       Enable timing logs
+  GPROJ_MAX_DEPTH=N   Max depth (default: 8)
+  GPROJ_CACHE=0       Disable cache
+  GPROJ_CACHE_TTL=N   Cache seconds (default: 1800)
+  GPROJ_INCLUDE_SUBMODULES=1  [Reserved] Future type labeling
+
+Examples:
+  gproj
+  GPROJ_DEBUG=1 gproj
+  gproj --cmd 'code "{}"'
+EOF
+}
+
+CMD=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  -h | --help)
+    show_help
+    exit 0
+    ;;
+  --roots)
+    ROOTS_ENV="$2"
+    shift 2
+    ;;
+  --ignores)
+    IGNORES_ENV="$2"
+    shift 2
+    ;;
+  --cmd)
+    CMD="$2"
+    shift 2
+    ;;
+  --)
+    shift
+    break
+    ;;
+  -*)
+    echo "Unknown: $1" >&2
+    exit 1
+    ;;
+  *) break ;;
+  esac
+done
+
+log_timing "init"
+
+IFS=':' read -r -a ROOTS <<<"${ROOTS_ENV:-$(printf '%s\n' "${DEFAULT_ROOTS[@]}" | paste -sd: -)}"
+IFS=':' read -r -a IGNORES <<<"${IGNORES_ENV:-$(printf '%s\n' "${DEFAULT_IGNORES[@]}" | paste -sd: -)}"
+
+for i in "${!ROOTS[@]}"; do ROOTS[$i]="${ROOTS[$i]/#\~/$HOME}"; done
+for i in "${!IGNORES[@]}"; do IGNORES[$i]="${IGNORES[$i]/#\~/$HOME}"; done
+
+log_timing "config"
+
+TMPF=$(mktemp)
+trap 'rm -f "$TMPF"' EXIT
+
+# Cache setup
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
+CACHE_KEY=$(echo "${ROOTS[*]}" | md5sum 2>/dev/null | cut -d' ' -f1 || echo "default")
+CACHE_FILE="$CACHE_DIR/$CACHE_KEY"
+
+USE_CACHE=0
+if [ "$CACHE_ENABLED" -eq 1 ] && [ -f "$CACHE_FILE" ]; then
+  CACHE_AGE=$(($(date +%s) - $(stat -f %m "$CACHE_FILE" 2>/dev/null || stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 999999)))
+  if [ "$CACHE_AGE" -lt "$CACHE_TTL" ]; then
+    USE_CACHE=1
+    [ "$DEBUG" -eq 1 ] && echo "[gproj] Using cache (age: ${CACHE_AGE}s)" >&2
+  fi
+fi
+
+if [ "$USE_CACHE" -eq 1 ]; then
+  cp "$CACHE_FILE" "$TMPF"
+  log_timing "cache-hit"
+else
+  # Build exclude args
+  FD_EXCLUDE=()
+  FIND_PRUNE=()
+  for ig in "${IGNORES[@]}"; do
+    ig_exp="${ig/#\~/$HOME}"
+    if [ "$ig" = "node_modules" ]; then
+      FD_EXCLUDE+=(--exclude node_modules)
+      FIND_PRUNE+=(-name node_modules -o)
+    else
+      FD_EXCLUDE+=(--exclude "$ig_exp")
+      FIND_PRUNE+=(-path "$ig_exp" -o)
+    fi
+  done
+  # Remove trailing -o from FIND_PRUNE
+  if [ ${#FIND_PRUNE[@]} -gt 0 ]; then
+    FIND_PRUNE=("${FIND_PRUNE[@]:0:${#FIND_PRUNE[@]}-1}")
+  fi
+
+  USE_FD=1
+  command -v fd >/dev/null 2>&1 && USE_FD=1
+
+  TMP=$(mktemp)
+  trap 'rm -f "$TMP" "$TMPF"' EXIT
+
+  for R in "${ROOTS[@]}"; do
+    [ -d "$R" ] || continue
+    [ "$DEBUG" -eq 1 ] && echo "[gproj] Scanning $R (depth: $MAX_DEPTH)..." >&2
+
+    if [ "$USE_FD" -eq 1 ]; then
+      # fd command rationale:
+      #   --hidden (-H)   : Required to find .git files/directories
+      #   --follow        : Follows symlinks for worktree support (~0.5s overhead)
+      #                     Not strictly needed now, but useful for edge cases
+      #                     Removing would save ~0.5s but break symlinked repos
+      #   -g '.git'       : Glob pattern (simpler than regex)
+      #   --max-depth     : Configurable via GPROJ_MAX_DEPTH (default: 8)
+      #   NO -t flag      : Find both files (worktrees) AND directories (main repos)
+      #
+      # Performance comparison (tested on ~/AgodaGit):
+      #   fd -g '[. ]git' --ignore-file <(echo '!.git/') : ~4.0s
+      #   fd -H -g '\.git' -t d                          : ~4.0s  
+      #   fd -H --follow -g '\.git' -t d                 : ~4.5s (previous)
+      #   fd -H --follow -g '\.git' (no -t)              : ~4.5s (current - finds worktrees too!)
+      #
+      # Decision: Keep --follow despite 0.5s penalty for symlink/worktree support
+      # Note: Removed -t d to find both .git files (worktrees) and directories (main repos)
+      fd --hidden --follow --max-depth "$MAX_DEPTH" -g '.git' "$R" "${FD_EXCLUDE[@]}" 2>/dev/null >>"$TMP" || true
+    else
+      # Find both .git files (worktrees) and directories (main repos)
+      if [ ${#FIND_PRUNE[@]} -gt 0 ]; then
+        eval "find \"$R\" -maxdepth $MAX_DEPTH \( ${FIND_PRUNE[*]} \) -prune -o -name .git -print" 2>/dev/null >>"$TMP" || true
+      else
+        find "$R" -maxdepth "$MAX_DEPTH" -name .git -print 2>/dev/null >>"$TMP" || true
+      fi
+    fi
+  done
+
+  log_timing "scan"
+
+  [ "$DEBUG" -eq 1 ] && echo "[gproj] Found $(wc -l <"$TMP" | xargs) .git dirs" >&2
+
+  # Convert to repo roots
+  sed 's|/\.git/*$||' "$TMP" | sort -u >"$TMPF"
+  rm -f "$TMP"
+
+  log_timing "normalize"
+
+  # Save cache
+  [ "$CACHE_ENABLED" -eq 1 ] && cp "$TMPF" "$CACHE_FILE" 2>/dev/null || true
+fi
+
+[ ! -s "$TMPF" ] && {
+  echo "No repos found" >&2
+  exit 1
+}
+[ "$DEBUG" -eq 1 ] && echo "[gproj] Ready: $(wc -l <"$TMPF" | xargs) repos" >&2
+
+log_timing "ready"
+
+command -v fzf >/dev/null 2>&1 || {
+  cat "$TMPF"
+  exit 0
+}
+
+# Common dir for footer
+COMMON_DIR="/"
+if [ -n "${ROOTS[0]:-}" ]; then
+  COMMON_DIR="${ROOTS[0]}"
+  for r in "${ROOTS[@]:1}"; do
+    while [ "${r#$COMMON_DIR}" = "$r" ] && [ -n "$COMMON_DIR" ]; do
+      COMMON_DIR="${COMMON_DIR%/*}"
+    done
+  done
+  [ -z "$COMMON_DIR" ] && COMMON_DIR="/"
+fi
+
+# Lightweight preview
+read -r -d '' PREVIEW_SCRIPT <<'PREVIEW_EOF' || true
+#!/usr/bin/env bash
+D="$1"
+cd "$D" 2>/dev/null || exit 1
+echo "📁 $(basename "$D")"
+echo "📂 $D"
+echo ""
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  B=$(git branch --show-current 2>/dev/null || echo "(detached)")
+  echo "🌿 $B"
+  GD=$(git rev-parse --git-dir 2>/dev/null)
+  if [[ "$GD" == *".git/worktrees/"* ]]; then
+    MR=$(cd "$(git rev-parse --git-common-dir)/.." && pwd)
+    echo "🔗 Worktree of: $MR"
+  fi
+  echo ""
+  echo "📊 Status:"
+  git status --short 2>/dev/null | head -10
+  echo ""
+  M=$(git status --short 2>/dev/null | wc -l | xargs)
+  echo "📈 Modified: $M"
+  echo ""
+  echo "📝 Recent:"
+  git --no-pager log --oneline -n 5 --color=always 2>/dev/null
+fi
+PREVIEW_EOF
+
+HEADER="ENTER=cd | CTRL-V=nvim | CTRL-E=code | CTRL-R=refresh | TAB=select | ESC=cancel | 📂 $COMMON_DIR"
+
+# Reload script for ctrl-r (invalidate cache and rescan)
+read -r -d '' RELOAD_SCRIPT <<'RELOAD_EOF' || true
+#!/usr/bin/env bash
+CACHE_FILE="$1"
+shift
+ROOTS_STR="$1"
+shift
+IGNORES_STR="$1"
+shift
+MAX_DEPTH="$1"
+DEBUG="${2:-0}"
+
+# Delete cache to force rescan
+rm -f "$CACHE_FILE" 2>/dev/null
+
+# Parse roots and ignores back into arrays
+IFS='|' read -r -a ROOTS <<< "$ROOTS_STR"
+IFS='|' read -r -a IGNORES <<< "$IGNORES_STR"
+
+# Build exclude args
+FD_EXCLUDE=()
+for ig in "${IGNORES[@]}"; do
+  [ -z "$ig" ] && continue
+  if [ "$ig" = "node_modules" ]; then
+    FD_EXCLUDE+=(--exclude node_modules)
+  else
+    FD_EXCLUDE+=(--exclude "$ig")
+  fi
+done
+
+# Scan repos
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+
+for R in "${ROOTS[@]}"; do
+  # Skip empty or non-existent directories
+  [ -z "$R" ] && continue
+  [ ! -d "$R" ] && continue
+  [ "$DEBUG" -eq 1 ] && echo "[gproj] Rescanning $R..." >&2
+  fd --hidden --follow --max-depth "$MAX_DEPTH" -g '.git' "$R" "${FD_EXCLUDE[@]}" 2>/dev/null >>"$TMP" || true
+done
+
+# Convert to repo roots and output
+sed 's|/\.git/*$||' "$TMP" | sort -u
+rm -f "$TMP"
+RELOAD_EOF
+
+# ============================================================================
+# DRAFT: alt-w binding for worktree listing (COMMENTED OUT - NOT IMPLEMENTED)
+# ============================================================================
+# This section contains draft code for future worktree listing feature.
+# To enable: uncomment and add --bind line to fzf invocations below.
+#
+# # Worktree listing script for nested fzf
+# read -r -d '' WORKTREE_SCRIPT <<'WORKTREE_EOF' || true
+# #!/usr/bin/env bash
+# REPO="$1"
+# CURRENT_PANE="${2:-%0}"
+# 
+# # Check if repo has worktrees
+# cd "$REPO" 2>/dev/null || exit 1
+# 
+# # Get worktree list
+# WORKTREES=$(git worktree list --porcelain 2>/dev/null | awk '
+#   /^worktree / { path = substr($0, 10); }
+#   /^branch / { branch = substr($0, 8); }
+#   /^$/ { 
+#     if (path != "" && branch != "") {
+#       # Format: /path/to/worktree [🔗branch-name]
+#       printf "%s [🔗%s]\n", path, branch;
+#       path = "";
+#       branch = "";
+#     }
+#   }
+# ')
+# 
+# [ -z "$WORKTREES" ] && echo "No worktrees found for this repo" && exit 0
+# 
+# # Launch nested fzf for worktree selection
+# echo "$WORKTREES" | fzf \
+#   --ansi \
+#   --prompt="worktree> " \
+#   --header="ENTER=cd | CTRL-L=lazygit | CTRL-V=nvim | CTRL-E=code | ESC=cancel" \
+#   --preview="echo 'Worktree: {}' && echo '' && git -C {} status --short 2>/dev/null" \
+#   --preview-window="right:50%:wrap" \
+#   --bind="enter:execute-silent(tmux send-keys -t $CURRENT_PANE 'cd \"{}\"' Enter)+abort" \
+#   --bind="ctrl-l:execute-silent(tmux send-keys -t $CURRENT_PANE 'lazygit -p \"{}\"' Enter)+abort" \
+#   --bind="ctrl-v:execute-silent(tmux send-keys -t $CURRENT_PANE 'nvim \"{}\"' Enter)+abort" \
+#   --bind="ctrl-e:execute-silent(tmux send-keys -t $CURRENT_PANE 'code \"{}\"' Enter)+abort"
+# WORKTREE_EOF
+#
+# # Add this binding to fzf invocations below (in tmux section):
+# #   --bind="alt-w:execute(bash -c $(printf '%q' "$WORKTREE_SCRIPT") -- {} $CURRENT_PANE)" \
+#
+# ============================================================================
+
+# Prepare reload parameters (join arrays with |)
+ROOTS_JOINED=$(printf '%s|' "${ROOTS[@]}")
+ROOTS_JOINED="${ROOTS_JOINED%|}"  # Remove trailing |
+IGNORES_JOINED=$(printf '%s|' "${IGNORES[@]}")
+IGNORES_JOINED="${IGNORES_JOINED%|}"
+
+# Check if running in tmux
+IN_TMUX=0
+[ -n "${TMUX:-}" ] && IN_TMUX=1
+
+if [ "$IN_TMUX" -eq 1 ]; then
+  # In tmux - use execute-silent to send keys to current pane
+  # Get the current pane ID
+  CURRENT_PANE="${TMUX_PANE:-%0}"
+
+  SELECTED=$(fzf \
+    --ansi \
+    --multi \
+    --prompt='gproj> ' \
+    --header="$HEADER" \
+    --preview "bash -c $(printf '%q' "$PREVIEW_SCRIPT") -- {}" \
+    --preview-window='right:60%:wrap' \
+    --bind="enter:execute-silent(tmux send-keys -t $CURRENT_PANE 'cd \"{}\"' Enter)+abort" \
+    --bind="ctrl-v:execute-silent(tmux send-keys -t $CURRENT_PANE 'nvim \"{}\"' Enter)+abort" \
+    --bind="ctrl-e:execute-silent(tmux send-keys -t $CURRENT_PANE 'code \"{}\"' Enter)+abort" \
+    --bind="ctrl-o:accept" \
+    --bind="ctrl-r:reload(bash -c $(printf '%q' "$RELOAD_SCRIPT") gproj-reload $(printf '%q' "$CACHE_FILE") $(printf '%q' "$ROOTS_JOINED") $(printf '%q' "$IGNORES_JOINED") $MAX_DEPTH $DEBUG)" \
+    <"$TMPF")
+else
+  # Not in tmux - just return the selection for manual use
+  SELECTED=$(fzf \
+    --ansi \
+    --multi \
+    --prompt='gproj> ' \
+    --header="$HEADER (use in tmux for cd support)" \
+    --preview "bash -c $(printf '%q' "$PREVIEW_SCRIPT") -- {}" \
+    --preview-window='right:60%:wrap' \
+    --bind="ctrl-r:reload(bash -c $(printf '%q' "$RELOAD_SCRIPT") gproj-reload $(printf '%q' "$CACHE_FILE") $(printf '%q' "$ROOTS_JOINED") $(printf '%q' "$IGNORES_JOINED") $MAX_DEPTH $DEBUG)" \
+    <"$TMPF")
+fi
+
+[ -z "${SELECTED:-}" ] && exit 130
+
+if [ -n "$CMD" ]; then
+  exec sh -c "$(printf '%s' "$CMD" | sed "s|{}|\"$SELECTED\"|g")"
+else
+  # Print the path (useful for scripting or ctrl-o binding)
+  printf '%s\n' "$SELECTED"
+fi

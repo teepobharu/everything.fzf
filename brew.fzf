@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 #!/bin/bash
 
 # brew.fzf - Interactive Homebrew package manager with FZF
@@ -28,40 +30,40 @@ export -f sanitize_package_name
 format_brew_preview() {
   local pkg="$1"
   local info=$(brew info "$pkg" 2>/dev/null)
-  
+
   # Color codes
   local bold='\033[1m'
   local reverse='\033[7m'
   local reset='\033[0m'
-  
+
   # Process line by line
   local in_installed=0
   local line_count=0
-  
+
   echo "$info" | while IFS= read -r line; do
     ((line_count++))
-    
+
     # Highlight first line (versions: stable, HEAD)
     if [ $line_count -eq 1 ]; then
       echo -e "${bold}${line}${reset}"
       echo ""
       continue
     fi
-    
+
     # Highlight "Installed" section header
     if [[ "$line" =~ ^Installed$ ]]; then
       echo -e "${bold}${line}${reset}"
       in_installed=1
       continue
     fi
-    
+
     # Highlight installed path/version (cellar path)
     if [[ "$line" =~ ^/opt/homebrew/Cellar ]] || [[ "$line" =~ ^/usr/local/Cellar ]]; then
       echo -e "${reverse}${line}${reset}"
       in_installed=0
       continue
     fi
-    
+
     # Normal output
     echo "$line"
   done
@@ -78,15 +80,17 @@ do_upgrade() {
   printf "\nUpgrade all? (y/n): "
   read -r confirm
   if [ "$confirm" = y ] || [ "$confirm" = Y ]; then
-    # Process each package line by line, handling special chars properly
+    # Process each package line by line, handling newlines properly
     while IFS= read -r pkg || [ -n "$pkg" ]; do
+      # Skip empty lines
       [ -z "$pkg" ] && continue
       sanitized=$(sanitize_package_name "$pkg")
       echo "Upgrading $pkg..."
-      brew upgrade "$pkg" 2>&1 | tee ~/dotfiles/logs/brew-${sanitized}.log
+      # Redirect stdin from /dev/null to prevent brew from consuming the loop's stdin
+      brew upgrade "$pkg" < /dev/null 2>&1 | tee ~/dotfiles/logs/brew-${sanitized}.log
       echo "✓ $pkg upgraded"
+      echo ""
     done <<< "$selected"
-    echo ""
     echo "✓ All upgrades completed!"
   else
     echo "Cancelled."
@@ -104,14 +108,46 @@ do_uninstall() {
   printf "\nUninstall all? (y/n): "
   read -r confirm
   if [ "$confirm" = y ] || [ "$confirm" = Y ]; then
-    # Process each package line by line, handling special chars properly
+    # Process each package line by line, handling newlines properly
     while IFS= read -r pkg || [ -n "$pkg" ]; do
+      # Skip empty lines
       [ -z "$pkg" ] && continue
       sanitized=$(sanitize_package_name "$pkg")
       echo "Uninstalling $pkg..."
-      brew uninstall "$pkg" 2>&1 | tee ~/dotfiles/logs/brew-uninstall-${sanitized}.log
+      # Redirect stdin from /dev/null to prevent brew from consuming the loop's stdin
+      brew uninstall "$pkg" < /dev/null 2>&1 | tee ~/dotfiles/logs/brew-uninstall-${sanitized}.log
       echo "✓ $pkg uninstalled"
+      echo ""
     done <<< "$selected"
+    echo "✓ All uninstalls completed!"
+  else
+    echo "Cancelled."
+  fi
+}
+
+export -f do_upgrade
+
+# Function to perform uninstall action
+do_uninstall() {
+  local selected="$1"
+  echo ""
+  echo "Selected packages to uninstall:"
+  echo "$selected" | sed 's/^/  - /'
+  printf "\nUninstall all? (y/n): "
+  read -r confirm
+  if [ "$confirm" = y ] || [ "$confirm" = Y ]; then
+    # Collect all packages into an array first
+    mapfile -t packages <<<"$selected"
+
+    # Process each package
+    for pkg in "${packages[@]}"; do
+      [ -z "$pkg" ] && continue
+      sanitized=$(sanitize_package_name "$pkg")
+      echo "Uninstalling $pkg..."
+      # Redirect brew output to log completely (no tee to avoid mixing with stdout)
+      brew uninstall "$pkg" >~/dotfiles/logs/brew-uninstall-${sanitized}.log 2>&1
+      echo "✓ $pkg uninstalled"
+    done
     echo ""
     echo "✓ All uninstalls completed!"
   else
@@ -137,7 +173,7 @@ while true; do
   fi
 
   # Run FZF with expect to capture key presses
-  result=$(echo "$package_list" | \
+  result=$(echo "$package_list" |
     fzf \
       --multi \
       --prompt="[$mode_label] $prompt_text: " \
@@ -152,65 +188,65 @@ while true; do
   selected=$(echo "$result" | tail -n +2)
 
   case "$key" in
-    ctrl-t)
-      # Toggle between outdated and all packages
-      show_outdated=$([ "$show_outdated" = true ] && echo false || echo true)
-      continue
-      ;;
-    ctrl-x)
-      # Upgrade selected packages
-      if [ -n "$selected" ]; then
+  ctrl-t)
+    # Toggle between outdated and all packages
+    show_outdated=$([ "$show_outdated" = true ] && echo false || echo true)
+    continue
+    ;;
+  ctrl-x)
+    # Upgrade selected packages
+    if [ -n "$selected" ]; then
+      do_upgrade "$selected"
+    fi
+    exit 0
+    ;;
+  ctrl-d)
+    # Uninstall selected packages
+    if [ -n "$selected" ]; then
+      do_uninstall "$selected"
+    fi
+    exit 0
+    ;;
+  ctrl-i)
+    # Open home for first selected package (open in background)
+    if [ -n "$selected" ]; then
+      first_pkg=$(echo "$selected" | head -1)
+      brew home "$first_pkg" &
+    fi
+    continue
+    ;;
+  "")
+    # Enter key pressed - default action based on mode
+    if [ -n "$selected" ]; then
+      if [ "$show_outdated" = true ]; then
+        # In outdated mode, default to upgrade
         do_upgrade "$selected"
-      fi
-      exit 0
-      ;;
-    ctrl-d)
-      # Uninstall selected packages
-      if [ -n "$selected" ]; then
-        do_uninstall "$selected"
-      fi
-      exit 0
-      ;;
-    ctrl-i)
-      # Open home for first selected package (open in background)
-      if [ -n "$selected" ]; then
-        first_pkg=$(echo "$selected" | head -1)
-        brew home "$first_pkg" &
-      fi
-      continue
-      ;;
-    "")
-      # Enter key pressed - default action based on mode
-      if [ -n "$selected" ]; then
-        if [ "$show_outdated" = true ]; then
-          # In outdated mode, default to upgrade
+      else
+        # In all packages mode, ask user what to do
+        echo ""
+        echo "Selected packages:"
+        echo "$selected" | sed 's/^/  - /'
+        echo ""
+        printf "Action - (u)pgrade, (d)elete, (c)ancel: "
+        read -r action_choice
+        case "$action_choice" in
+        u | U)
           do_upgrade "$selected"
-        else
-          # In all packages mode, ask user what to do
-          echo ""
-          echo "Selected packages:"
-          echo "$selected" | sed 's/^/  - /'
-          echo ""
-          printf "Action - (u)pgrade, (d)elete, (c)ancel: "
-          read -r action_choice
-          case "$action_choice" in
-            u|U)
-              do_upgrade "$selected"
-              ;;
-            d|D)
-              do_uninstall "$selected"
-              ;;
-            *)
-              echo "Cancelled."
-              ;;
-          esac
-        fi
+          ;;
+        d | D)
+          do_uninstall "$selected"
+          ;;
+        *)
+          echo "Cancelled."
+          ;;
+        esac
       fi
-      exit 0
-      ;;
-    *)
-      # User pressed ESC or other exit
-      exit 0
-      ;;
+    fi
+    exit 0
+    ;;
+  *)
+    # User pressed ESC or other exit
+    exit 0
+    ;;
   esac
 done
