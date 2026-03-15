@@ -79,7 +79,7 @@ do_upgrade() {
   echo "$selected" | sed 's/^/  - /'
   printf "\nUpgrade all? (y/n): "
   read -r confirm
-  if [ "$confirm" = y ] || [ "$confirm" = Y ]; then
+  if [ "$confirm" = y ] || [ "$confirm" = Y ] || [ -z "$confirm" ]; then
     # Process each package line by line, handling newlines properly
     while IFS= read -r pkg || [ -n "$pkg" ]; do
       # Skip empty lines
@@ -87,10 +87,10 @@ do_upgrade() {
       sanitized=$(sanitize_package_name "$pkg")
       echo "Upgrading $pkg..."
       # Redirect stdin from /dev/null to prevent brew from consuming the loop's stdin
-      brew upgrade "$pkg" < /dev/null 2>&1 | tee ~/dotfiles/logs/brew-${sanitized}.log
+      brew upgrade "$pkg" </dev/null 2>&1 | tee ~/dotfiles/logs/brew-${sanitized}.log
       echo "✓ $pkg upgraded"
       echo ""
-    done <<< "$selected"
+    done <<<"$selected"
     echo "✓ All upgrades completed!"
   else
     echo "Cancelled."
@@ -115,10 +115,10 @@ do_uninstall() {
       sanitized=$(sanitize_package_name "$pkg")
       echo "Uninstalling $pkg..."
       # Redirect stdin from /dev/null to prevent brew from consuming the loop's stdin
-      brew uninstall "$pkg" < /dev/null 2>&1 | tee ~/dotfiles/logs/brew-uninstall-${sanitized}.log
+      brew uninstall "$pkg" </dev/null 2>&1 | tee ~/dotfiles/logs/brew-uninstall-${sanitized}.log
       echo "✓ $pkg uninstalled"
       echo ""
-    done <<< "$selected"
+    done <<<"$selected"
     echo "✓ All uninstalls completed!"
   else
     echo "Cancelled."
@@ -179,8 +179,8 @@ while true; do
       --prompt="[$mode_label] $prompt_text: " \
       --preview-window="right:55%,wrap" \
       --preview="format_brew_preview {}" \
-      --expect=ctrl-t,ctrl-x,ctrl-d,ctrl-i \
-      --header="CTRL-T: toggle | CTRL-X: upgrade | CTRL-D: uninstall | CTRL-I: home | Enter: action" \
+      --expect=ctrl-t,ctrl-x,ctrl-d,alt-i \
+      --header="CTRL-T: toggle | CTRL-X: upgrade | CTRL-D: uninstall | alt-i: home | Enter: action" \
       "$@")
 
   # Separate key from selection
@@ -207,7 +207,7 @@ while true; do
     fi
     exit 0
     ;;
-  ctrl-i)
+  alt-i)
     # Open home for first selected package (open in background)
     if [ -n "$selected" ]; then
       first_pkg=$(echo "$selected" | head -1)

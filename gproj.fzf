@@ -355,8 +355,29 @@ sanitize_name() {
 
 is_valid_profile() {
   local profile_path="$1"
-  [ -d "$profile_path" ] || [ -L "$profile_path" ] || return 1
-  [ -f "$profile_path/init.lua" ] || [ -f "$profile_path/init.vim" ] || [ -d "$profile_path/lua" ]
+  # ignore check for now
+  # TODO: check if $1 dir is a git root or submodule root or a git worktree root
+  # must exist
+  [ -e "$profile_path" ] || return 1
+    # fail if it's a regular file (but allow directories or symlinks-to-directories)
+  if [ -f "$profile_path" ] && [ ! -d "$profile_path" ]; then
+    return 1
+  fi
+  [ -f "$profile_path/init.lua" ] || [ -f "$profile_path/init.vim" ] || [ -d "$profile_path/lua" ] && {
+    # check for a git repo:
+    # - a .git directory (normal repo)
+    # - a .git file (submodule/linked gitdir)
+    [ -d "$profile_path/.git" ] || [ -f "$profile_path/.git" ] && return 0
+
+    # did not really affect
+    # fall back to asking git whether this path is inside a work tree
+    if command -v git >/dev/null 2>&1; then
+      if git -C "$profile_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+  } || return 1
+
 }
 
 TARGET_BASENAME=$(basename "$TARGET_PATH")
